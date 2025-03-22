@@ -1,0 +1,373 @@
+---
+title: "TCGA BRCA with DiffNaps"
+author: "Anonymous"
+date: "2023-08-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(recount3)
+library(recount)
+library(data.table)
+library(biomaRt)
+require(ggplot2)
+require(ggthemes)
+require(viridis)
+library(DOSE)
+library(clusterProfiler)
+organism <- "org.Hs.eg.db"
+library(organism, character.only = TRUE)
+```
+
+## Preparation of TCGA breast cancer data for DiffNaps
+
+In the following, we download and prepare breast cancer data from The Cancer Genome Atlas according to the manuscript.
+
+### Data download and gene expression transformation
+
+We first download the uniformly re-processed data through [recount](https://rna.recount.bio).
+Then, we transform gene expression counts using the common TPM normalization,
+divide the data into adjacent normal and primary tumor samples,
+and filter for genes that are protein-coding and for which at least one sample has non-zero expression.
+Lastly, we filter out duplicate samples, i.e., individuals where we have multiple replicates of the tumor tissue.
+
+```{r TCGA download}
+
+## This should be adapted to the user's preferred location for the data download
+setwd("/Path/To/Diffnaps/Experiments")
+
+cancer <- "BRCA"
+## Download data and create the RSE object
+TCGA_lung <- recount3::create_rse_manual(
+  project = cancer,
+  project_home = "data_sources/tcga",
+  organism = "human",
+  annotation = "gencode_v26",
+  type = "gene"
+)
+
+## get all the annotations and metadata as data frame
+info_samples_tcga <- as.data.frame(colData(TCGA_lung))
+info_genes_tcga <- as.data.frame(rowRanges(TCGA_lung))
+
+## Compute TPMs
+assays(TCGA_lung)$counts <- recount3::transform_counts(TCGA_lung)
+assays(TCGA_lung)$TPM <- recount::getTPM(TCGA_lung)
+
+## Partition into normal tissue
+TCGA_lung_normal <- log(assays(TCGA_lung)$TPM[,!is.na(info_samples_tcga$tcga.cgc_sample_sample_type) & info_samples_tcga$tcga.cgc_sample_sample_type == "Solid Tissue Normal"] + 1)
+info_samples_tcga_normal <- info_samples_tcga[!is.na(info_samples_tcga$tcga.cgc_sample_sample_type) & info_samples_tcga$tcga.cgc_sample_sample_type == "Solid Tissue Normal",]
+## and primary tumor tissue
+tumor_only_idcs <- info_samples_tcga$tcga.cgc_sample_sample_type == "Primary Tumor"
+tumor_only_idcs[is.na(tumor_only_idcs)] <- F
+info_samples_tcga <- info_samples_tcga[tumor_only_idcs,]
+TCGA_lung <- TCGA_lung[,tumor_only_idcs]
+
+## Filter genes
+keep <-(rowSums(assays(TCGA_lung)$TPM) > 0) & (info_genes_tcga$gene_type == "protein_coding")
+expression_filtered <- assays(TCGA_lung)$TPM[keep,]
+
+## Remove duplicates
+sample_barcodes <- sapply(info_samples_tcga$tcga.tcga_barcode, substr, 1, 12)
+seq_depth <- colSums(assays(TCGA_lung)$counts[keep,])
+duplicate_throwout <- rep(NA, ncol(assays(TCGA_lung)$TPM))
+for (idx in 1:ncol(assays(TCGA_lung)$TPM))
+{
+  if (is.na(duplicate_throwout[idx]))
+  {
+    ## find all vials and replicates of current sample
+    rep_idcs <- sample_barcodes[idx] == sample_barcodes
+    ## get those with highest seq depth
+    max_sample_idx <- which.max(seq_depth * rep_idcs)
+    ## throw out all but maximum one
+    duplicate_throwout[rep_idcs] <- T
+    duplicate_throwout[max_sample_idx] <- F
+  }
+}
+## Filter metadata for non-duplicate samples
+info_samples_tcga <- info_samples_tcga[!duplicate_throwout,]
+
+## Filter TPM matrices for non-duplicates
+TCGA_TPM_filtered_ge = log2(expression_filtered+1)[,!duplicate_throwout]
+rownames(TCGA_TPM_filtered_ge) <- rownames(expression_filtered)
+colnames(TCGA_TPM_filtered_ge) <- info_samples_tcga$tcga.tcga_barcode
+
+## Check PCA for outliers in gene expression space
+pca_exp <- prcomp(t(TCGA_TPM_filtered_ge), scale=F, center=F, rank.=2)
+pca_data <- as.data.frame(t(TCGA_TPM_filtered_ge) %*% pca_exp$rotation)
+colnames(pca_data) <- c("PCA1", "PCA2")
+gg <- ggplot(pca_data, aes(x=PCA1, y=PCA2)) +
+  geom_point(size=2) + theme_minimal()
+gg
+
+## Produce the final gene expression matrix of dimension samples x genes
+TCGA_TPM_filtered_tumor <- TCGA_TPM_filtered_ge
+rownames(TCGA_TPM_filtered_tumor) <- sapply(rownames(TCGA_TPM_filtered_tumor), function(x) {strsplit(x, '.', fixed=T)[[1]][1]})
+colnames(TCGA_TPM_filtered_tumor) <- sapply(colnames(TCGA_TPM_filtered_tumor), substr, 1, 12)
+TCGA_TPM_filtered_tumor <- t(TCGA_TPM_filtered_tumor)
+```
+
+
+### Preparation of BRCA-N
+
+The first dataset, BRCA-N, consists of primary tumor and adjacent normal tissue with corresponding labels.
+To obtain a balanced and fairly similar (w.r.t. genetic background) dataset, we filter for those samples where both,
+adjacent normal and primary tumor tissue, is available.
+We binarize gene expression based on the upper quartile of TPMs, where the quartiles are computed per gene.
+
+```{r BRCA-N}
+
+## Produce balanced dataset based on matched samples only
+colnames(TCGA_lung_normal) <- info_samples_tcga_normal$tcga.tcga_barcode
+
+TCGA_all_balanced <- rbind(TCGA_TPM_filtered_tumor[sapply(rownames(TCGA_TPM_filtered_tumor), substr, 1, 12) %in%
+                                                     sapply(colnames(TCGA_lung_normal), substr, 1, 12),],
+                           t(TCGA_lung_normal[keep, sapply(colnames(TCGA_lung_normal), substr, 1, 12) %in%
+                                                sapply(rownames(TCGA_TPM_filtered_tumor), substr, 1, 12)]))
+
+## Binarize based on quartiles
+data <- do.call(cbind, lapply(1:ncol(TCGA_all_balanced), function(i)
+{
+  thresh <- quantile(TCGA_all_balanced[,i], prob=c(.75), type=1)
+  return(as.numeric(TCGA_all_balanced[,i] >= thresh & TCGA_all_balanced[,i] > 0))
+}))
+colnames(data) <- colnames(TCGA_all_balanced)
+
+## Write data into CWD
+write.table(data, file=paste0("./",tolower(cancer),"_processed_logtpm_balanced_75perc.tsv"), sep="\t", row.names = F, col.names = T, quote=F)
+write.table(c(rep("Tumor", nrow(data)/2), rep("Adj normal", nrow(data)/2)), file=paste0("./",tolower(cancer),"_processed_logtpm_balanced_flag_tissue_origin.tsv"), sep="\t", row.names = F, col.names = F, quote=F)
+
+
+```
+
+
+### Preparation of BRCA-S
+
+The second dataset, BRCA-S, consists of primary tumor samples with subtype annotation.
+In particular, we partition the data into luminal A, luminal B, HER2+,* and *triple negative* breast cancer.
+We roughly balance the dataset, randomly subsampling subtypes for which we have more than 50 samples down to 50 without replacement.
+We binarize the data based on quartiles as before.
+
+```{r BRCA-S}
+## Assign subtypes following the common definition as in
+## https://www.ncbi.nlm.nih.gov/books/NBK583808/#:~:text=LUMINAL%20A%20SUBTYPE&text=Clinically%20they%20are%20low%20grade,benefit%20to%20chemotherapy%20(27). Table 1
+## while removing overlap in definitions setting 'some' to 'negative' for receptor status
+estro_receptor <- info_samples_tcga$tcga.xml_breast_carcinoma_estrogen_receptor_status
+progest_receptor <- info_samples_tcga$tcga.xml_breast_carcinoma_progesterone_receptor_status
+her2_status <- info_samples_tcga$tcga.xml_lab_proc_her2_neu_immunohistochemistry_receptor_status
+
+brca_group <- rep(NA, nrow(TCGA_TPM_filtered_tumor))
+brca_group[estro_receptor == "Positive" &
+                               progest_receptor == "Positive" &
+                               her2_status == "Negative"] <- "luminal A"
+brca_group[estro_receptor == "Positive" &
+                               progest_receptor == "Negative" &
+                               her2_status == "Negative"] <- "luminal B"
+brca_group[estro_receptor == "Negative" &
+                               progest_receptor == "Negative" &
+                               her2_status == "Positive"] <- "HER2+"
+brca_group[estro_receptor == "Negative" &
+                               progest_receptor == "Negative" &
+                               her2_status == "Negative"] <- "triple negative"
+
+mapped_vals <- c("luminal A", "luminal B", "HER2+", "triple negative")
+subtype_flag <- match(brca_group, mapped_vals)
+
+## Binarize data based on quartiles
+data <- do.call(cbind, lapply(1:ncol(TCGA_TPM_filtered_tumor), function(i)
+{
+  thresh <- quantile(TCGA_TPM_filtered_tumor[,i], prob=c(.75), type=1)
+  return(as.numeric(TCGA_TPM_filtered_tumor[,i] >= thresh & TCGA_TPM_filtered_tumor[,i] > 0))
+}))
+colnames(data) <- colnames(TCGA_TPM_filtered_tumor)
+
+## Roughly balance data, keeping at leas 50 samples, if possible
+k <- 50
+balance <- rep(F, length(subtype_flag[!is.na(brca_group)]))
+invisible(sapply(unique(subtype_flag[!is.na(brca_group)]), function (i)
+{
+  balance[subtype_flag[!is.na(brca_group)] == i][sample(sum(subtype_flag[!is.na(brca_group)] == i), min(k, sum(subtype_flag[!is.na(brca_group)] == i)))] <<- T
+}))
+
+
+## Write data into CWD
+write.table(data[!is.na(brca_group),][balance,], file=paste0("./",tolower(cancer),"_processed_logtpm_tumor_noduplicates_75_perc_subtypebalanced.tsv"), sep="\t", row.names = F, col.names = T, quote=F)
+write.table(subtype_flag[!is.na(brca_group)][balance], file=paste0("./",tolower(cancer),"_subtype_flag.tsv"), sep="\t", row.names = F, col.names = F, quote=F)
+
+```
+
+
+## Analysis of DiffNaps results
+
+The patterns discovered by DiffNaps in BRCA-N and BRCA-S are analyzed according to the main manuscript,
+focusing on pathway enrichment analysis across patterns to avoid cherry-picking within the qualitative analysis.
+For the interested reader, we provide both KEGG and GO analysis, as well as all patterns along with label information in "patterns_named" and "labels". We also provide enrichment results for each pattern in the list "gsor".
+
+```{r analysis BRCA-N}
+
+## Read DiffNaps results
+## The path needs to be adapted by the user
+data <- readLines('./res_brca.tsv')
+data <- data[-1]
+data <- strsplit(data, '\t', fixed=T)
+labels <- sapply(data,  function(x){x[1]})
+patterns <- sapply(data, function(x){x[2]})
+patterns <- strsplit(patterns, '\'', fixed=T)
+patterns <- lapply(patterns, function(x) {x[grepl('ENSG', x, fixed=T)]})
+
+## Load biomart and map gene ids to entrez ids
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+## Background set is given by all genes in the input data provided to DiffNaps
+genesMapFull <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=sapply(strsplit(rownames(TCGA_TPM_filtered_ge), '.', fixed=T), function(x){x[[1]]}),
+  mart=mart)
+## Gene set over-representation analysis for each pattern
+gsor <- lapply(patterns, function(genes)
+{
+  genesMap <- getBM(
+    filters="ensembl_gene_id",
+    attributes=c("ensembl_gene_id", "entrezgene_id"),
+    uniqueRows = T,
+    useCache=F,
+    values=genes,
+    mart=mart)
+  go <- enrichGO(genesMap[,2],
+                     'org.Hs.eg.db',
+                     ont="BP",
+                     pvalueCutoff = .05,
+                     universe = as.character(genesMapFull[,2]),
+                     minGSSize=5)
+
+  kegg <- enrichKEGG(genesMap[,2],
+                organism     = 'hsa',
+                 pvalueCutoff = .05,
+                 universe = as.character(genesMapFull[,2]),
+                 minGSSize=5)
+  return(list(go=go, kegg=kegg))
+})
+
+## Gene Set over-representation analysis for union of patterns per label
+gos <- lapply(unique(labels), function(l)
+{
+genesMap <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=unique(do.call(c,patterns[labels == l])),
+  mart=mart)
+go <- enrichGO(genesMap[,2],
+               'org.Hs.eg.db',
+               ont="BP",
+               pvalueCutoff = .01,
+               universe = as.character(genesMapFull[,2]),
+               minGSSize=3)
+kegg <- enrichKEGG(genesMap[,2],
+                   organism     = 'hsa',
+                   pvalueCutoff = .01,
+                   universe = as.character(genesMapFull[,2]),
+                   minGSSize=3)
+return(list(go=go, kegg=kegg, genes=unique(do.call(c,patterns[labels == l]))))
+})
+names(gos) <- unique(labels)
+
+print(names(gos))
+
+print(head(gos$`Adj normal`$kegg@result, n=5))
+print(head(gos$`tumor`$kegg@result, n=5))
+
+## Mapping of patterns to gene names for the interested reader
+patterns_named <- lapply(patterns, function(p)
+{
+  info_genes_tcga$gene_name[sapply(info_genes_tcga$gene_id, function(x){strsplit(x, '.', fixed=T)[[1]][1]}) %in% p]
+})
+```
+
+```{r analysis BRCA-S}
+## This should be adapted to the path were DiffNaps results are saved
+
+## Read results
+data <- readLines('./res_brca_subtypes.tsv')
+data <- data[-1]
+data <- strsplit(data, '\t', fixed=T)
+labels <- sapply(data,  function(x){x[1]})
+patterns <- sapply(data, function(x){x[2]})
+patterns <- strsplit(patterns, '\'', fixed=T)
+patterns <- lapply(patterns, function(x) {x[grepl('ENSG', x, fixed=T)]})
+
+## Do GSOR as before
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+genesMapFull <- getBM(
+  filters="ensembl_gene_id",
+  attributes=c("ensembl_gene_id", "entrezgene_id"),
+  uniqueRows = T,
+  useCache=F,
+  values=sapply(strsplit(rownames(TCGA_TPM_filtered_ge), '.', fixed=T), function(x){x[[1]]}),
+  mart=mart)
+
+gsor <- lapply(1:length(patterns), function(genes_idx)
+{
+  genes <- patterns[[genes_idx]]
+  genesMap <- getBM(
+    filters="ensembl_gene_id",
+    attributes=c("ensembl_gene_id", "entrezgene_id"),
+    uniqueRows = T,
+    useCache=F,
+    values=genes,
+    mart=mart)
+  go <- enrichGO(genesMap[,2],
+                 'org.Hs.eg.db',
+                 ont="BP",
+                 pvalueCutoff = .05,
+                 universe = as.character(genesMapFull[,2]),
+                 minGSSize=3)
+  
+  kegg <- enrichKEGG(genesMap[,2],
+                     organism     = 'hsa',
+                     pvalueCutoff = .05,
+                     universe = as.character(genesMapFull[,2]),
+                     minGSSize=3)
+  return(list(go=go, kegg=kegg, label=mapped_vals[as.numeric(labels[genes_idx]) + 1]))
+})
+
+## look at the union
+gos <- lapply(unique(labels), function(l)
+{
+  genesMap <- getBM(
+    filters="ensembl_gene_id",
+    attributes=c("ensembl_gene_id", "entrezgene_id"),
+    uniqueRows = T,
+    useCache=F,
+    values=unique(do.call(c,patterns[labels == l])),
+    mart=mart)
+  go <- enrichGO(genesMap[,2],
+                 'org.Hs.eg.db',
+                 ont="BP",
+                 pvalueCutoff = .05,
+                 universe = as.character(genesMapFull[,2]),
+                 minGSSize=3)
+  kegg <- enrichKEGG(genesMap[,2],
+                     organism     = 'hsa',
+                     pvalueCutoff = .05,
+                     universe = as.character(genesMapFull[,2]),
+                     minGSSize=3)
+  return(list(go=go, kegg=kegg, genes=unique(do.call(c,patterns[labels == l]))))
+})
+names(gos) <- mapped_vals[as.numeric(unique(labels)) + 1]
+
+print(head(gos$`luminal A`$kegg@result, n=5))
+print(head(gos$`luminal B`$kegg@result, n=5))
+print(head(gos$`HER2+`$kegg@result, n=5))
+print(head(gos$`triple negative`$kegg@result, n=5))
+
+patterns_named <- lapply(patterns, function(p)
+{
+  info_genes_tcga$gene_name[sapply(info_genes_tcga$gene_id, function(x){strsplit(x, '.', fixed=T)[[1]][1]}) %in% p]
+})
+```
+
